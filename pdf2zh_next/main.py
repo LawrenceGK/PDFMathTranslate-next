@@ -5,6 +5,7 @@ output it to plain text, html, xml or tags.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
@@ -45,23 +46,21 @@ def find_all_files_in_directory(directory_path):
 
 
 async def main() -> int:
-    from rich.logging import RichHandler
+    """Main async entry for running translation tasks.
 
-    logging.basicConfig(level=logging.INFO, handlers=[RichHandler()])
+    Assumes logging has already been configured by the caller.
+    """
 
     settings = ConfigManager().initialize_config()
+
+    # If config requests debug, elevate root logger
     if settings.basic.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # disable httpx, openai, httpcore, http11 logs
-    logging.getLogger("httpx").setLevel("CRITICAL")
-    logging.getLogger("httpx").propagate = False
-    logging.getLogger("openai").setLevel("CRITICAL")
-    logging.getLogger("openai").propagate = False
-    logging.getLogger("httpcore").setLevel("CRITICAL")
-    logging.getLogger("httpcore").propagate = False
-    logging.getLogger("http11").setLevel("CRITICAL")
-    logging.getLogger("http11").propagate = False
+    # disable noisy third-party logs
+    for name in ("httpx", "openai", "httpcore", "http11"):
+        logging.getLogger(name).setLevel("CRITICAL")
+        logging.getLogger(name).propagate = False
 
     for v in logging.Logger.manager.loggerDict.values():
         if getattr(v, "name", None) is None:
@@ -93,14 +92,85 @@ async def main() -> int:
         )
         return 0
 
+    # If config indicates HTTP API, caller should start server instead
+    if settings.basic.http_api:
+        logger.error("Configuration requests HTTP API mode; caller should start server")
+        return -1
+
     assert len(settings.basic.input_files) >= 1, "At least one input file is required"
     await do_translate_file_async(settings, ignore_error=True)
     return 0
 
 
-def cli():
+def configure_logging(debug: bool = False) -> None:
+    """Configure root logging using rich if available.
+
+    This should be called once at startup before other modules log.
+    """
+
+    try:
+        from rich.logging import RichHandler
+
+        handlers = [RichHandler(
+            show_time=True,
+            show_level=True,
+            show_path=True,
+            rich_tracebacks=True,
+            tracebacks_show_locals=debug,
+        )]
+    except Exception:
+        handlers = None
+
+    if handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            handlers=handlers,
+            force=True,  # Override any existing configuration
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        )
+
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Configure uvicorn loggers to use the same handlers
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uvicorn_logger = logging.getLogger(logger_name)
+        uvicorn_logger.handlers = logging.getLogger().handlers
+        uvicorn_logger.propagate = False
+
+
+def run():
+    """Synchronous entry point. Parses args, configures logging and dispatches.
+
+    Behavior:
+    - If `--http-api` is passed, start the server directly.
+    - Otherwise run the async `main()` flow which loads full config.
+    """
+
+    parser = argparse.ArgumentParser(prog="pdf2zh-next")
+    parser.add_argument("--http-api", action="store_true", help="Start HTTP API server")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    # Configure logging early
+    configure_logging(debug=args.debug)
+
+    # If CLI flag requests http_api, start server directly without loading full config
+    if args.http_api:
+        from pdf2zh_next.http_api import run_server
+
+        logger.info("Starting HTTP API server...")
+        run_server(host="0.0.0.0", port=11008, reload=args.debug)
+        return
+
+    # Otherwise run the async main flow (which loads and validates config)
     sys.exit(asyncio.run(main()))
 
 
 if __name__ == "__main__":
-    cli()
+    run()
