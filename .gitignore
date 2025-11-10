@@ -173,4 +173,5 @@ cython_debug/
 uv.lock
 *.pdf
 *.docx
+copilot-instructions.md
 CLAUDE.md
