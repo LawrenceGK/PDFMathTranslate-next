@@ -142,7 +142,7 @@ class TranslationRequest(BaseModel):
     
     # Glossary options
     no_auto_extract_glossary: bool = Field(
-        default=False, description="Disable automatic term extraction"
+        default=True, description="Disable automatic term extraction"
     )
     save_auto_extracted_glossary: bool = Field(
         default=False, description="Save automatically extracted glossary"
@@ -491,7 +491,7 @@ async def create_translation(
     custom_system_prompt: str | None = Form(None),
     pool_max_workers: int | None = Form(None),
     # Glossary options
-    no_auto_extract_glossary: bool = Form(False),
+    no_auto_extract_glossary: bool = Form(True),
     save_auto_extracted_glossary: bool = Form(False),
     # Advanced options
     rpc_doclayout: str | None = Form(None),
