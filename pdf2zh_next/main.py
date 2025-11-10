@@ -63,7 +63,7 @@ async def main() -> int:
         logging.getLogger(name).propagate = False
 
     for v in logging.Logger.manager.loggerDict.values():
-        if getattr(v, "name", None) is None:
+        if not isinstance(v, logging.Logger):
             continue
         if (
             v.name.startswith("pdfminer")
@@ -106,36 +106,65 @@ def configure_logging(debug: bool = False) -> None:
     """Configure root logging using rich if available.
 
     This should be called once at startup before other modules log.
+    Logs are written to both console and a rotating file.
     """
+    from logging.handlers import RotatingFileHandler
+    
+    # Create logs directory if it doesn't exist
+    logs_dir = Path.cwd() / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    
+    # Setup file handler with rotation (max 10MB, keep 5 backup files)
+    log_file = logs_dir / "pdf2zh_next.log"
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+
+    handlers: list[logging.Handler] = [file_handler]
 
     try:
         from rich.logging import RichHandler
 
-        handlers = [RichHandler(
+        rich_handler = RichHandler(
             show_time=True,
             show_level=True,
             show_path=True,
             rich_tracebacks=True,
             tracebacks_show_locals=debug,
-        )]
+        )
+        handlers.append(rich_handler)
     except Exception:
-        handlers = None
+        # Fallback to standard console handler if rich is not available
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        handlers.append(console_handler)
 
-    if handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(message)s",
-            handlers=handlers,
-            force=True,  # Override any existing configuration
-        )
-    else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=handlers,
+        force=True,  # Override any existing configuration
+    )
 
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
+    
+    logger.info(f"Logging to file: {log_file}")
     
     # Configure uvicorn loggers to use the same handlers
     for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
