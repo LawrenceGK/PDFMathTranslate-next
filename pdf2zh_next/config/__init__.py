@@ -19,6 +19,7 @@ from pdf2zh_next.config.translate_engine_model import GrokSettings
 from pdf2zh_next.config.translate_engine_model import GroqSettings
 from pdf2zh_next.config.translate_engine_model import ModelScopeSettings
 from pdf2zh_next.config.translate_engine_model import OllamaSettings
+from pdf2zh_next.config.translate_engine_model import OpenAICompatibleSettings
 from pdf2zh_next.config.translate_engine_model import OpenAISettings
 from pdf2zh_next.config.translate_engine_model import QwenMtSettings
 from pdf2zh_next.config.translate_engine_model import SiliconFlowSettings
@@ -36,6 +37,7 @@ __all__ = [
     "BingSettings",
     "GoogleSettings",
     "OpenAISettings",
+    "OpenAICompatibleSettings",
     "DeepLSettings",
     "OllamaSettings",
     "XinferenceSettings",

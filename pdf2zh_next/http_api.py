@@ -24,6 +24,7 @@ from pydantic import Field
 from sse_starlette.sse import EventSourceResponse
 
 from pdf2zh_next.high_level import do_translate_async_stream
+from pdf2zh_next.models_config import SUPPORTED_MODELS, DEFAULT_MODEL, is_model_supported
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,12 @@ temp_files: dict[str, list[Path]] = {}
 class TranslationRequest(BaseModel):
     """Request model for translation."""
 
+    # Model selection (required)
+    model: str = Field(
+        default=DEFAULT_MODEL, 
+        description=f"Translation model name. Use GET /v1/models to see all available models. Default: {DEFAULT_MODEL}"
+    )
+    
     # Basic settings
     lang_in: str = Field(default="en", description="Source language code")
     lang_out: str = Field(default="zh", description="Target language code")
@@ -49,12 +56,6 @@ class TranslationRequest(BaseModel):
     )
     no_mono: bool = Field(
         default=False, description="Do not output monolingual PDF files"
-    )
-    translate_engine_type: str = Field(
-        default="google", description="Translation engine type"
-    )
-    service: str | None = Field(
-        default=None, description="Translation service (alias for translate_engine_type)"
     )
     
     # PDF processing options
@@ -235,23 +236,45 @@ app.add_middleware(
 def create_settings_from_request(
     request: TranslationRequest, input_file: Path
 ) -> Any:
-    """Create settings from translation request."""
+    """Create settings from translation request.
+    
+    All translations use OpenAI Compatible API.
+    Configuration is loaded from environment variables:
+    - OPENAI_API_BASE: API endpoint (base URL)
+    - OPENAI_API_KEY: API key
+    """
+    import os
     from pdf2zh_next.config import (
-        AzureSettings,
         BasicSettings,
-        DeepLSettings,
-        GoogleSettings,
-        OllamaSettings,
-        OpenAISettings,
+        OpenAICompatibleSettings,
         PDFSettings,
         SettingsModel,
-        TencentSettings,
         TranslationSettings,
-        XinferenceSettings,
     )
 
-    # Use service field if provided, otherwise use translate_engine_type
-    engine_type = request.service or request.translate_engine_type
+    # Validate model
+    if not is_model_supported(request.model):
+        raise ValueError(
+            f"Unsupported model: {request.model}. "
+            f"Use GET /v1/models to see all available models."
+        )
+
+    # Read configuration from environment variables
+    base_url = os.environ.get("OPENAI_API_BASE")
+    api_key = os.environ.get("OPENAI_API_KEY")
+    
+    if not base_url:
+        raise ValueError(
+            "OPENAI_API_BASE environment variable is required. "
+            "Please set it to your OpenAI-compatible API endpoint."
+        )
+    if not api_key:
+        raise ValueError(
+            "OPENAI_API_KEY environment variable is required. "
+            "Please set it to your API key."
+        )
+
+    logger.info(f"Using model: {request.model}")
 
     # Create basic settings
     basic = BasicSettings(input_files={str(input_file)})
@@ -298,84 +321,12 @@ def create_settings_from_request(
         figure_table_protection_threshold=request.figure_table_protection_threshold,
     )
 
-    # Create engine-specific settings
-    translate_engine_settings = None
-    engine_type_lower = engine_type.lower()
-
-    # Map lowercase engine types to proper case format
-    engine_type_map = {
-        "google": "Google",
-        "deepl": "DeepL",
-        "openai": "OpenAI",
-        "azure": "Azure",
-        "azureopenai": "AzureOpenAI",
-        "ollama": "Ollama",
-        "tencent": "TencentMechineTranslation",
-        "tencentmechinetranslation": "TencentMechineTranslation",
-        "xinference": "Xinference",
-        "bing": "Bing",
-        "deepseek": "DeepSeek",
-        "modelscope": "ModelScope",
-        "zhipu": "Zhipu",
-        "siliconflow": "SiliconFlow",
-        "siliconflowfree": "SiliconFlowFree",
-        "gemini": "Gemini",
-        "anythingllm": "AnythingLLM",
-        "dify": "Dify",
-        "grok": "Grok",
-        "groq": "Groq",
-        "qwenmt": "QwenMt",
-        "openaicompatible": "OpenAICompatible",
-    }
-    
-    proper_engine_type = engine_type_map.get(engine_type_lower, "Google")
-
-    logger.info(f"Creating translation settings with engine type: {proper_engine_type} (from input: {engine_type})")
-
-    if engine_type_lower == "google":
-        translate_engine_settings = GoogleSettings()
-    elif engine_type_lower == "openai":
-        # OpenAI requires model and api_key
-        if not request.openai_model:
-            request.openai_model = "gpt-4o-mini"
-        translate_engine_settings = OpenAISettings(
-            openai_model=request.openai_model,
-            openai_base_url=request.openai_base_url,
-            openai_api_key=request.openai_api_key,
-        )
-    elif engine_type_lower == "azure":
-        translate_engine_settings = AzureSettings(
-            azure_api_key=request.azure_api_key,
-            azure_endpoint=request.azure_endpoint,
-        )
-    elif engine_type_lower == "deepl":
-        translate_engine_settings = DeepLSettings(
-            deepl_auth_key=request.deepl_auth_key,
-        )
-    elif engine_type_lower == "ollama":
-        # Ollama requires model
-        if not request.ollama_model:
-            request.ollama_model = "gemma2"
-        translate_engine_settings = OllamaSettings(
-            ollama_model=request.ollama_model,
-            ollama_host=request.ollama_host,
-        )
-    elif engine_type_lower == "tencent" or engine_type_lower == "tencentmechinetranslation":
-        translate_engine_settings = TencentSettings(
-            tencentcloud_secret_id=request.tencentcloud_secret_id,
-            tencentcloud_secret_key=request.tencentcloud_secret_key,
-        )
-    elif engine_type_lower == "xinference":
-        # Xinference requires model
-        if not request.xinference_model:
-            request.xinference_model = "gemma-2-it"
-        translate_engine_settings = XinferenceSettings(
-            xinference_model=request.xinference_model,
-            xinference_host=request.xinference_host,
-        )
-    else:
-        # Default to Google if unknown engine type
-        translate_engine_settings = GoogleSettings()
+    # Create OpenAI Compatible settings for AIHubMix
+    translate_engine_settings = OpenAICompatibleSettings(
+        openai_compatible_model=request.model,
+        openai_compatible_base_url=base_url,
+        openai_compatible_api_key=api_key,
+    )
 
     # Create settings model
     settings = SettingsModel(
@@ -455,13 +406,12 @@ async def process_translation_task(task_id: str, settings: Any, input_file: Path
 @app.post("/v1/translate", response_model=dict)
 async def create_translation(
     file: UploadFile = File(...),
+    model: str = Form(DEFAULT_MODEL),
     lang_in: str = Form("en"),
     lang_out: str = Form("zh"),
     pages: str | None = Form(None),
     no_dual: bool = Form(False),
     no_mono: bool = Form(False),
-    translate_engine_type: str = Form("google"),
-    service: str | None = Form(None),
     # PDF processing options
     split_short_lines: bool = Form(False),
     short_line_split_factor: float = Form(0.8),
@@ -495,24 +445,24 @@ async def create_translation(
     save_auto_extracted_glossary: bool = Form(False),
     # Advanced options
     rpc_doclayout: str | None = Form(None),
-    # Engine-specific parameters
-    openai_model: str | None = Form(None),
-    openai_base_url: str | None = Form(None),
-    openai_api_key: str | None = Form(None),
-    azure_api_key: str | None = Form(None),
-    azure_endpoint: str | None = Form(None),
-    deepl_auth_key: str | None = Form(None),
-    ollama_model: str | None = Form(None),
-    ollama_host: str | None = Form(None),
-    tencentcloud_secret_id: str | None = Form(None),
-    tencentcloud_secret_key: str | None = Form(None),
-    xinference_model: str | None = Form(None),
-    xinference_host: str | None = Form(None),
 ):
     """
     Create a new translation task.
 
-    Returns a task ID that can be used to check status and download results.
+    All translations use OpenAI Compatible API.
+    Configuration must be set via environment variables:
+    - OPENAI_API_BASE: OpenAI-compatible API endpoint (base URL)
+    - OPENAI_API_KEY: API key
+
+    Args:
+        file: PDF file to translate
+        model: Model name (use GET /v1/models to see available models)
+        lang_in: Source language code
+        lang_out: Target language code
+        ... (other PDF processing options)
+
+    Returns:
+        Task information with task_id for status checking
     """
     # Validate file
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -541,13 +491,12 @@ async def create_translation(
 
         # Create translation request
         request = TranslationRequest(
+            model=model,
             lang_in=lang_in,
             lang_out=lang_out,
             pages=pages,
             no_dual=no_dual,
             no_mono=no_mono,
-            translate_engine_type=translate_engine_type,
-            service=service,
             # PDF processing options
             split_short_lines=split_short_lines,
             short_line_split_factor=short_line_split_factor,
@@ -581,19 +530,6 @@ async def create_translation(
             save_auto_extracted_glossary=save_auto_extracted_glossary,
             # Advanced options
             rpc_doclayout=rpc_doclayout,
-            # Engine-specific parameters
-            openai_model=openai_model,
-            openai_base_url=openai_base_url,
-            openai_api_key=openai_api_key,
-            azure_api_key=azure_api_key,
-            azure_endpoint=azure_endpoint,
-            deepl_auth_key=deepl_auth_key,
-            ollama_model=ollama_model,
-            ollama_host=ollama_host,
-            tencentcloud_secret_id=tencentcloud_secret_id,
-            tencentcloud_secret_key=tencentcloud_secret_key,
-            xinference_model=xinference_model,
-            xinference_host=xinference_host,
         )
 
         # Create settings
@@ -797,6 +733,28 @@ async def delete_translation_task(task_id: str):
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "service": "pdf2zh-next-api"}
+
+
+@app.get("/v1/models")
+async def list_models():
+    """
+    Get list of supported translation models.
+    
+    Returns all available models that can be used for translation.
+    Models are grouped by provider (OpenAI, Anthropic, Google, etc.).
+    
+    Response includes:
+    - id: Model identifier to use in translation requests
+    - name: Human-readable model name
+    - provider: Model provider (OpenAI, Anthropic, Google, DeepSeek, Alibaba)
+    - description: Brief description of the model
+    - context_length: Maximum context length in tokens
+    """
+    return {
+        "models": SUPPORTED_MODELS,
+        "total": len(SUPPORTED_MODELS),
+        "default_model": DEFAULT_MODEL,
+    }
 
 
 @app.get("/v1/tasks")
