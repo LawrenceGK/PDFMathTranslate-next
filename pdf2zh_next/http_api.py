@@ -81,7 +81,7 @@ class TranslationRequest(BaseModel):
         default=False, description="Use alternating pages mode for dual PDF"
     )
     watermark_output_mode: str = Field(
-        default="watermarked", 
+        default="no_watermark", 
         description="Control watermark output mode: 'watermarked' (default), 'no_watermark', or 'both'"
     )
     max_pages_per_part: int | None = Field(
@@ -420,7 +420,7 @@ async def create_translation(
     disable_rich_text_translate: bool = Form(False),
     enhance_compatibility: bool = Form(False),
     use_alternating_pages_dual: bool = Form(False),
-    watermark_output_mode: str = Form("watermarked"),
+    watermark_output_mode: str = Form("no_watermark"),
     max_pages_per_part: int | None = Form(None),
     translate_table_text: bool = Form(True),
     formular_font_pattern: str | None = Form(None),
