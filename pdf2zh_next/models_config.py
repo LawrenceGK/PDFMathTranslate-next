@@ -15,7 +15,7 @@ class ModelInfo(TypedDict):
 # Supported models via OpenAI Compatible API
 SUPPORTED_MODELS: list[ModelInfo] = [
     {
-        "id": "deepseek-chat",
+        "id": "DeepSeek-V3.2-Exp",
         "name": "DeepSeek V3.2",
         "provider": "DeepSeek",
         "description": "Advanced reasoning model from DeepSeek",
@@ -52,7 +52,7 @@ SUPPORTED_MODELS: list[ModelInfo] = [
 ]
 
 # Default model if none specified
-DEFAULT_MODEL = "deepseek-chat"
+DEFAULT_MODEL = "DeepSeek-V3.2-Exp"
 
 
 def get_model_by_id(model_id: str) -> ModelInfo | None:
