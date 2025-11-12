@@ -166,11 +166,18 @@ def configure_logging(debug: bool = False) -> None:
     
     logger.info(f"Logging to file: {log_file}")
     
-    # Configure uvicorn loggers to use the same handlers
+    # Configure uvicorn loggers to use the same handlers and filter health checks
     for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         uvicorn_logger = logging.getLogger(logger_name)
         uvicorn_logger.handlers = logging.getLogger().handlers
         uvicorn_logger.propagate = False
+    
+    # Add filter to suppress health check logs
+    class HealthCheckFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "/v1/health" not in record.getMessage()
+    
+    logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
 
 
 def run():
