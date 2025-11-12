@@ -28,12 +28,18 @@ from pdf2zh_next.models_config import SUPPORTED_MODELS, DEFAULT_MODEL, is_model_
 
 logger = logging.getLogger(__name__)
 
+# Configuration constants
+TEMP_DIR_BASE = Path(tempfile.gettempdir()) / "pdf2zh_next_api"
+MAX_TASK_AGE_HOURS = 72  # Auto-cleanup tasks older than this
+CLEANUP_INTERVAL_SECONDS = 3600  # Run cleanup every hour
+MAX_STORAGE_GB = 10  # Maximum storage limit in GB
+
 # In-memory storage for translation tasks
 translation_tasks: dict[str, dict[str, Any]] = {}
 # Store output files
 translation_files: dict[str, dict[str, Path]] = {}
-# Store temp files for cleanup
-temp_files: dict[str, list[Path]] = {}
+# Store task directories for cleanup
+task_directories: dict[str, Path] = {}
 
 
 class TranslationRequest(BaseModel):
@@ -191,6 +197,105 @@ class TranslationStatusResponse(BaseModel):
     dual_file: str | None = None
 
 
+def get_task_directory(task_id: str) -> Path:
+    """Get the directory path for a specific task."""
+    return TEMP_DIR_BASE / task_id
+
+
+def check_storage_available(required_size: int = 0) -> tuple[bool, str]:
+    """Check if storage is available for new tasks.
+    
+    Args:
+        required_size: Estimated size needed for new task (in bytes)
+        
+    Returns:
+        Tuple of (is_available, error_message)
+    """
+    if not TEMP_DIR_BASE.exists():
+        return True, ""
+    
+    # Calculate current usage
+    current_usage = 0
+    for file_path in TEMP_DIR_BASE.rglob("*"):
+        if file_path.is_file():
+            try:
+                current_usage += file_path.stat().st_size
+            except Exception:
+                pass
+    
+    max_bytes = MAX_STORAGE_GB * 1024 * 1024 * 1024
+    
+    if current_usage + required_size > max_bytes:
+        current_gb = current_usage / (1024 ** 3)
+        return False, (
+            f"Storage limit exceeded. Current usage: {current_gb:.2f}GB / {MAX_STORAGE_GB}GB. "
+            f"Please wait for automatic cleanup or delete old tasks."
+        )
+    
+    return True, ""
+
+
+async def cleanup_old_tasks():
+    """Clean up tasks older than MAX_TASK_AGE_HOURS."""
+    current_time = time.time()
+    max_age_seconds = MAX_TASK_AGE_HOURS * 3600
+    
+    tasks_to_delete = []
+    
+    for task_id, task_data in translation_tasks.items():
+        # Only cleanup completed or error tasks
+        if task_data["status"] not in ["completed", "error", "cancelled"]:
+            continue
+            
+        # Check if task is old enough
+        completed_at = task_data.get("completed_at", task_data.get("created_at", 0))
+        if current_time - completed_at > max_age_seconds:
+            tasks_to_delete.append(task_id)
+    
+    # Delete old tasks
+    for task_id in tasks_to_delete:
+        try:
+            await delete_task_files(task_id)
+            logger.info(f"Auto-cleaned old task: {task_id}")
+        except Exception as e:
+            logger.error(f"Error auto-cleaning task {task_id}: {e}")
+
+
+async def delete_task_files(task_id: str):
+    """Delete all files associated with a task."""
+    # Remove from memory
+    if task_id in translation_files:
+        del translation_files[task_id]
+    
+    if task_id in translation_tasks:
+        del translation_tasks[task_id]
+    
+    # Delete task directory
+    if task_id in task_directories:
+        task_dir = task_directories[task_id]
+        try:
+            if task_dir.exists():
+                import shutil
+                shutil.rmtree(task_dir)
+                logger.debug(f"Deleted task directory: {task_dir}")
+        except Exception as e:
+            logger.error(f"Error deleting task directory {task_dir}: {e}")
+        del task_directories[task_id]
+
+
+async def cleanup_task_loop():
+    """Background task to periodically clean up old tasks."""
+    while True:
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+            await cleanup_old_tasks()
+        except asyncio.CancelledError:
+            logger.info("Cleanup task loop cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in cleanup task loop: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for the FastAPI app."""
@@ -202,18 +307,29 @@ async def lifespan(app: FastAPI):
         logging.getLogger(logger_name).setLevel("CRITICAL")
         logging.getLogger(logger_name).propagate = False
 
+    # Start background cleanup task
+    cleanup_task = asyncio.create_task(cleanup_task_loop())
+
     yield
 
     # Shutdown
     logger.info("HTTP API server shutting down...")
-    # Cleanup temp files
-    for task_id, files in temp_files.items():
-        for file in files:
-            try:
-                if file.exists():
-                    file.unlink()
-            except Exception as e:
-                logger.error(f"Error cleaning up temp file {file}: {e}")
+    
+    # Cancel cleanup task
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    
+    # Cleanup all task directories
+    import shutil
+    if TEMP_DIR_BASE.exists():
+        try:
+            shutil.rmtree(TEMP_DIR_BASE)
+            logger.info(f"Cleaned up temp directory: {TEMP_DIR_BASE}")
+        except Exception as e:
+            logger.error(f"Error cleaning up temp directory: {e}")
 
 
 app = FastAPI(
@@ -234,7 +350,7 @@ app.add_middleware(
 
 
 def create_settings_from_request(
-    request: TranslationRequest, input_file: Path
+    request: TranslationRequest, input_file: Path, output_dir: Path
 ) -> Any:
     """Create settings from translation request.
     
@@ -242,6 +358,11 @@ def create_settings_from_request(
     Configuration is loaded from environment variables:
     - OPENAI_API_BASE: API endpoint (base URL)
     - OPENAI_API_KEY: API key
+    
+    Args:
+        request: Translation request parameters
+        input_file: Path to input PDF file
+        output_dir: Directory for output files
     """
     import os
     from pdf2zh_next.config import (
@@ -279,7 +400,7 @@ def create_settings_from_request(
     # Create basic settings
     basic = BasicSettings(input_files={str(input_file)})
 
-    # Create translation settings
+    # Create translation settings with output directory
     translation = TranslationSettings(
         lang_in=request.lang_in,
         lang_out=request.lang_out,
@@ -292,6 +413,7 @@ def create_settings_from_request(
         save_auto_extracted_glossary=request.save_auto_extracted_glossary,
         primary_font_family=request.primary_font_family,
         rpc_doclayout=request.rpc_doclayout,
+        output=str(output_dir),  # Set output directory
     )
 
     # Create PDF settings
@@ -469,25 +591,28 @@ async def create_translation(
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     try:
+        # Check storage availability
+        content = await file.read()
+        file_size = len(content)
+        
+        is_available, error_msg = check_storage_available(file_size * 3)  # Estimate 3x size for processing
+        if not is_available:
+            raise HTTPException(status_code=507, detail=error_msg)
+        
         # Generate task ID
         task_id = str(uuid.uuid4())
 
-        # Save uploaded file to temp location
-        temp_dir = Path(tempfile.gettempdir()) / "pdf2zh_next_api"
-        temp_dir.mkdir(exist_ok=True)
+        # Create task directory
+        task_dir = get_task_directory(task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task_directories[task_id] = task_dir
 
-        # Create unique filename using hash to avoid collisions
-        content = await file.read()
+        # Save uploaded file to task directory
         file_hash = hashlib.md5(content).hexdigest()[:8]
-        input_file = temp_dir / f"{task_id}_{file_hash}_{file.filename}"
+        input_file = task_dir / f"input_{file_hash}_{file.filename}"
 
         with open(input_file, "wb") as f:
             f.write(content)
-
-        # Track temp file for cleanup
-        if task_id not in temp_files:
-            temp_files[task_id] = []
-        temp_files[task_id].append(input_file)
 
         # Create translation request
         request = TranslationRequest(
@@ -532,8 +657,8 @@ async def create_translation(
             rpc_doclayout=rpc_doclayout,
         )
 
-        # Create settings
-        settings = create_settings_from_request(request, input_file)
+        # Create settings with output directory
+        settings = create_settings_from_request(request, input_file, task_dir)
 
         # Initialize task
         translation_tasks[task_id] = {
@@ -701,29 +826,8 @@ async def delete_translation_task(task_id: str):
     if task_id not in translation_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Clean up files
-    if task_id in translation_files:
-        for file_path in translation_files[task_id].values():
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-            except Exception as e:
-                logger.error(f"Error deleting file {file_path}: {e}")
-        del translation_files[task_id]
-
-    # Clean up temp files
-    if task_id in temp_files:
-        for file_path in temp_files[task_id]:
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-            except Exception as e:
-                logger.error(f"Error deleting temp file {file_path}: {e}")
-        del temp_files[task_id]
-
-    # Remove task
-    del translation_tasks[task_id]
-
+    await delete_task_files(task_id)
+    
     logger.info(f"Deleted translation task {task_id}")
 
     return {"message": "Task deleted successfully"}
