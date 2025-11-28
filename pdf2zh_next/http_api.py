@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import logging
 import tempfile
 import time
@@ -11,6 +12,8 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+import chardet
 
 from fastapi import FastAPI
 from fastapi import File
@@ -296,6 +299,140 @@ async def cleanup_task_loop():
             logger.error(f"Error in cleanup task loop: {e}")
 
 
+import csv
+
+
+class GlossaryProcessingError(Exception):
+    """Exception raised when glossary file processing fails."""
+    def __init__(self, filename: str, message: str):
+        self.filename = filename
+        self.message = message
+        super().__init__(f"Glossary file '{filename}': {message}")
+
+
+class GlossaryProcessingResult:
+    """Result of processing glossary files."""
+    def __init__(self):
+        self.glossary_paths: list[str] = []
+        self.warnings: list[str] = []
+        self.errors: list[str] = []
+    
+    @property
+    def has_errors(self) -> bool:
+        return len(self.errors) > 0
+    
+    @property
+    def glossaries_str(self) -> str | None:
+        return ",".join(self.glossary_paths) if self.glossary_paths else None
+
+
+def validate_glossary_csv(content: str, filename: str) -> tuple[bool, str | None]:
+    """Validate that the CSV content has required columns.
+    
+    Args:
+        content: CSV file content as string
+        filename: Original filename for error messages
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        # Try to parse CSV
+        reader = csv.DictReader(io.StringIO(content))
+        fieldnames = reader.fieldnames
+        
+        if not fieldnames:
+            return False, "CSV file is empty or has no header row"
+        
+        # Check for required columns
+        required_columns = {"source", "target"}
+        available_columns = {col.lower().strip() for col in fieldnames}
+        
+        missing_columns = required_columns - available_columns
+        if missing_columns:
+            return False, f"Missing required columns: {', '.join(missing_columns)}. CSV must have 'source' and 'target' columns"
+        
+        # Check if there's at least one data row
+        first_row = next(reader, None)
+        if first_row is None:
+            return False, "CSV file has header but no data rows"
+        
+        return True, None
+        
+    except csv.Error as e:
+        return False, f"Invalid CSV format: {e}"
+
+
+def process_glossary_files(glossary_files: list[UploadFile] | None, task_dir: Path) -> GlossaryProcessingResult:
+    """Process uploaded glossary files and save them to the task directory.
+    
+    Args:
+        glossary_files: List of uploaded glossary CSV files
+        task_dir: Task directory to save processed files
+        
+    Returns:
+        GlossaryProcessingResult containing paths, warnings, and errors
+    """
+    result = GlossaryProcessingResult()
+    
+    if not glossary_files:
+        return result
+    
+    for idx, file in enumerate(glossary_files):
+        filename = file.filename or f"unknown_{idx}"
+        
+        # Check if file is empty
+        if file.size == 0:
+            result.warnings.append(f"'{filename}': File is empty, skipped")
+            continue
+        
+        # Check file extension
+        if not filename.lower().endswith(".csv"):
+            result.errors.append(f"'{filename}': Only CSV files are supported. Please upload a .csv file")
+            continue
+            
+        try:
+            # Read file content
+            content = file.file.read()
+            file.file.seek(0)  # Reset file pointer
+            
+            if not content:
+                result.warnings.append(f"'{filename}': File content is empty, skipped")
+                continue
+                
+            # Detect encoding and decode
+            detected = chardet.detect(content)
+            encoding = detected.get("encoding", "utf-8") or "utf-8"
+            
+            try:
+                text_content = content.decode(encoding)
+            except UnicodeDecodeError as e:
+                result.errors.append(f"'{filename}': Failed to decode file with detected encoding '{encoding}': {e}")
+                continue
+            
+            # Validate CSV format
+            is_valid, error_msg = validate_glossary_csv(text_content, filename)
+            if not is_valid:
+                result.errors.append(f"'{filename}': {error_msg}")
+                continue
+            
+            # Save to task directory with unique name
+            glossary_filename = f"glossary_{idx}_{filename}"
+            glossary_path = task_dir / glossary_filename
+            
+            with open(glossary_path, "w", encoding="utf-8") as f:
+                f.write(text_content)
+            
+            result.glossary_paths.append(str(glossary_path))
+            logger.debug(f"Processed glossary file: {filename} -> {glossary_path}")
+            
+        except IOError as e:
+            result.errors.append(f"'{filename}': Failed to read file: {e}")
+            continue
+    
+    return result
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for the FastAPI app."""
@@ -350,7 +487,8 @@ app.add_middleware(
 
 
 def create_settings_from_request(
-    request: TranslationRequest, input_file: Path, output_dir: Path
+    request: TranslationRequest, input_file: Path, output_dir: Path,
+    glossaries: str | None = None
 ) -> Any:
     """Create settings from translation request.
     
@@ -363,6 +501,7 @@ def create_settings_from_request(
         request: Translation request parameters
         input_file: Path to input PDF file
         output_dir: Directory for output files
+        glossaries: Comma-separated list of glossary file paths
     """
     import os
     from pdf2zh_next.config import (
@@ -414,6 +553,7 @@ def create_settings_from_request(
         primary_font_family=request.primary_font_family,
         rpc_doclayout=request.rpc_doclayout,
         output=str(output_dir),  # Set output directory
+        glossaries=glossaries,  # Pass glossary file paths
     )
 
     # Create PDF settings
@@ -528,6 +668,7 @@ async def process_translation_task(task_id: str, settings: Any, input_file: Path
 @app.post("/v1/translate", response_model=dict)
 async def create_translation(
     file: UploadFile = File(...),
+    glossary_files: list[UploadFile] | None = File(default=None, description="Glossary CSV files for term translation"),
     model: str = Form(DEFAULT_MODEL),
     lang_in: str = Form("en"),
     lang_out: str = Form("zh"),
@@ -578,6 +719,8 @@ async def create_translation(
 
     Args:
         file: PDF file to translate
+        glossary_files: Optional list of glossary CSV files for term translation.
+            Each CSV file should contain term pairs (source term, target term).
         model: Model name (use GET /v1/models to see available models)
         lang_in: Source language code
         lang_out: Target language code
@@ -657,8 +800,35 @@ async def create_translation(
             rpc_doclayout=rpc_doclayout,
         )
 
-        # Create settings with output directory
-        settings = create_settings_from_request(request, input_file, task_dir)
+        # Process glossary files
+        glossary_result = process_glossary_files(glossary_files, task_dir)
+        
+        # Check for glossary processing errors
+        if glossary_result.has_errors:
+            # Clean up task directory on error
+            import shutil
+            shutil.rmtree(task_dir, ignore_errors=True)
+            if task_id in task_directories:
+                del task_directories[task_id]
+            
+            error_detail = {
+                "message": "Failed to process glossary files",
+                "errors": glossary_result.errors,
+                "warnings": glossary_result.warnings if glossary_result.warnings else None,
+            }
+            raise HTTPException(status_code=400, detail=error_detail)
+        
+        # Log warnings if any
+        if glossary_result.warnings:
+            for warning in glossary_result.warnings:
+                logger.warning(f"Task {task_id} glossary warning: {warning}")
+        
+        glossaries = glossary_result.glossaries_str
+        if glossaries:
+            logger.info(f"Task {task_id}: Loaded glossary files: {glossaries}")
+
+        # Create settings with output directory and glossaries
+        settings = create_settings_from_request(request, input_file, task_dir, glossaries)
 
         # Initialize task
         translation_tasks[task_id] = {
@@ -667,6 +837,7 @@ async def create_translation(
             "filename": file.filename,
             "progress": None,
             "error": None,
+            "glossary_warnings": glossary_result.warnings if glossary_result.warnings else None,
         }
 
         # Start translation task in background
@@ -674,8 +845,13 @@ async def create_translation(
 
         logger.info(f"Created translation task {task_id} for file {file.filename}")
 
-        return {"task_id": task_id, "status": "queued"}
+        response: dict[str, Any] = {"task_id": task_id, "status": "queued"}
+        if glossary_result.warnings:
+            response["glossary_warnings"] = glossary_result.warnings
+        return response
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating translation task: {e}")
         raise HTTPException(status_code=500, detail=str(e))
