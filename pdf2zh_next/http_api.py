@@ -33,9 +33,12 @@ logger = logging.getLogger(__name__)
 
 # Configuration constants
 TEMP_DIR_BASE = Path(tempfile.gettempdir()) / "pdf2zh_next_api"
-MAX_TASK_AGE_HOURS = 72  # Auto-cleanup tasks older than this
-CLEANUP_INTERVAL_SECONDS = 3600  # Run cleanup every hour
-MAX_STORAGE_GB = 10  # Maximum storage limit in GB
+MAX_TASK_AGE_HOURS = 2  # Auto-cleanup tasks older than this (aggressive: 2 hours)
+MIN_TASK_AGE_MINUTES = 30  # Minimum age before task can be cleaned (allow download time)
+CLEANUP_INTERVAL_SECONDS = 300  # Run cleanup every 5 minutes (aggressive)
+MAX_STORAGE_GB = 2  # Maximum storage limit in GB (aggressive)
+STORAGE_WARNING_THRESHOLD = 0.7  # Start aggressive cleanup at 70% capacity
+MAX_TASK_SIZE_MB = 200  # Maximum size per task in MB
 
 # In-memory storage for translation tasks
 translation_tasks: dict[str, dict[str, Any]] = {}
@@ -205,6 +208,21 @@ def get_task_directory(task_id: str) -> Path:
     return TEMP_DIR_BASE / task_id
 
 
+def get_current_storage_usage() -> int:
+    """Get current storage usage in bytes."""
+    if not TEMP_DIR_BASE.exists():
+        return 0
+    
+    current_usage = 0
+    for file_path in TEMP_DIR_BASE.rglob("*"):
+        if file_path.is_file():
+            try:
+                current_usage += file_path.stat().st_size
+            except Exception:
+                pass
+    return current_usage
+
+
 def check_storage_available(required_size: int = 0) -> tuple[bool, str]:
     """Check if storage is available for new tasks.
     
@@ -214,24 +232,22 @@ def check_storage_available(required_size: int = 0) -> tuple[bool, str]:
     Returns:
         Tuple of (is_available, error_message)
     """
-    if not TEMP_DIR_BASE.exists():
-        return True, ""
+    # Check single task size limit
+    max_task_bytes = MAX_TASK_SIZE_MB * 1024 * 1024
+    if required_size > max_task_bytes:
+        return False, (
+            f"File too large. Maximum allowed size: {MAX_TASK_SIZE_MB}MB. "
+            f"Please use a smaller PDF file."
+        )
     
-    # Calculate current usage
-    current_usage = 0
-    for file_path in TEMP_DIR_BASE.rglob("*"):
-        if file_path.is_file():
-            try:
-                current_usage += file_path.stat().st_size
-            except Exception:
-                pass
-    
+    current_usage = get_current_storage_usage()
     max_bytes = MAX_STORAGE_GB * 1024 * 1024 * 1024
     
     if current_usage + required_size > max_bytes:
-        current_gb = current_usage / (1024 ** 3)
+        current_mb = current_usage / (1024 ** 2)
+        max_mb = MAX_STORAGE_GB * 1024
         return False, (
-            f"Storage limit exceeded. Current usage: {current_gb:.2f}GB / {MAX_STORAGE_GB}GB. "
+            f"Storage limit exceeded. Current usage: {current_mb:.1f}MB / {max_mb:.0f}MB. "
             f"Please wait for automatic cleanup or delete old tasks."
         )
     
@@ -239,29 +255,68 @@ def check_storage_available(required_size: int = 0) -> tuple[bool, str]:
 
 
 async def cleanup_old_tasks():
-    """Clean up tasks older than MAX_TASK_AGE_HOURS."""
+    """Clean up tasks based on age and storage pressure.
+    
+    Cleanup strategy (aggressive):
+    1. Always delete tasks older than MAX_TASK_AGE_HOURS (2 hours)
+    2. If storage > 70%, delete tasks older than MIN_TASK_AGE_MINUTES (30 min)
+    3. If storage > 90%, delete oldest completed tasks regardless of age
+    """
     current_time = time.time()
     max_age_seconds = MAX_TASK_AGE_HOURS * 3600
+    min_age_seconds = MIN_TASK_AGE_MINUTES * 60
+    
+    # Check storage pressure
+    current_usage = get_current_storage_usage()
+    max_bytes = MAX_STORAGE_GB * 1024 * 1024 * 1024
+    usage_ratio = current_usage / max_bytes if max_bytes > 0 else 0
     
     tasks_to_delete = []
+    completed_tasks_by_age = []  # (task_id, completed_at)
     
     for task_id, task_data in translation_tasks.items():
         # Only cleanup completed or error tasks
         if task_data["status"] not in ["completed", "error", "cancelled"]:
             continue
-            
-        # Check if task is old enough
+        
         completed_at = task_data.get("completed_at", task_data.get("created_at", 0))
-        if current_time - completed_at > max_age_seconds:
+        task_age = current_time - completed_at
+        
+        # Strategy 1: Always delete old tasks
+        if task_age > max_age_seconds:
             tasks_to_delete.append(task_id)
+            continue
+        
+        # Strategy 2: Under storage pressure, delete tasks older than minimum age
+        if usage_ratio > STORAGE_WARNING_THRESHOLD and task_age > min_age_seconds:
+            tasks_to_delete.append(task_id)
+            continue
+        
+        # Track for emergency cleanup
+        completed_tasks_by_age.append((task_id, completed_at))
     
-    # Delete old tasks
+    # Strategy 3: Emergency cleanup - delete oldest tasks if storage critical (>90%)
+    if usage_ratio > 0.9 and completed_tasks_by_age:
+        completed_tasks_by_age.sort(key=lambda x: x[1])  # Sort by age, oldest first
+        # Delete oldest 50% of remaining tasks
+        emergency_delete_count = max(1, len(completed_tasks_by_age) // 2)
+        for task_id, _ in completed_tasks_by_age[:emergency_delete_count]:
+            if task_id not in tasks_to_delete:
+                tasks_to_delete.append(task_id)
+                logger.warning(f"Emergency cleanup: deleting task {task_id} due to storage pressure")
+    
+    # Delete tasks
+    deleted_count = 0
     for task_id in tasks_to_delete:
         try:
             await delete_task_files(task_id)
-            logger.info(f"Auto-cleaned old task: {task_id}")
+            deleted_count += 1
+            logger.info(f"Auto-cleaned task: {task_id}")
         except Exception as e:
             logger.error(f"Error auto-cleaning task {task_id}: {e}")
+    
+    if deleted_count > 0:
+        logger.info(f"Cleanup completed: {deleted_count} tasks deleted, storage usage was {usage_ratio*100:.1f}%")
 
 
 async def delete_task_files(task_id: str):
@@ -288,6 +343,14 @@ async def delete_task_files(task_id: str):
 
 async def cleanup_task_loop():
     """Background task to periodically clean up old tasks."""
+    # Run initial cleanup on startup
+    await asyncio.sleep(5)  # Wait for server to fully start
+    try:
+        await cleanup_old_tasks()
+        logger.info("Initial cleanup completed")
+    except Exception as e:
+        logger.error(f"Error in initial cleanup: {e}")
+    
     while True:
         try:
             await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
