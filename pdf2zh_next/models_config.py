@@ -49,6 +49,13 @@ SUPPORTED_MODELS: list[ModelInfo] = [
         "description": "Latest Claude Haiku model",
         "context_length": 200000,
     },
+    {
+        "id": "gemini-2.0-flash",
+        "name": "Gemini-2.0-Flash",
+        "provider": "Google",
+        "description": "Google's Gemini Flash model",
+        "context_length": 128000,
+    }
 ]
 
 # Default model if none specified
